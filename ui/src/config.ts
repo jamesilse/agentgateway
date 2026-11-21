@@ -1,5 +1,6 @@
 import type { ConfigResource, ConfigResourceKind } from '@/api/configResourcesApi';
 import { keyValue } from '@/credentialDisplay';
+import { duplicateModelNamesWarning } from '@/duplicateModelNames';
 import type {
 	GatewayConfig,
 	LlmApiKeyPolicy,
@@ -377,10 +378,7 @@ export function configWarnings(
 		.filter(model => !model.id)
 		.map(model => model.name)
 		.filter((name, index, names) => names.indexOf(name) !== index);
-	if (duplicateNames.length > 0)
-		warnings.push(
-			`Duplicate model names may be ambiguous: ${Array.from(new Set(duplicateNames)).join(', ')}.`
-		);
+	if (duplicateNames.length > 0) warnings.push(duplicateModelNamesWarning(duplicateNames));
 	const duplicateIds = models
 		.map(model => model.id)
 		.filter((id): id is string => Boolean(id))
