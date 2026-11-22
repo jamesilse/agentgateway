@@ -2295,7 +2295,9 @@ impl AIProvider {
 			// Multipart bodies (e.g. audio transcriptions, image edits) are forwarded as-is, but we still
 			// read `model` so it can be logged and transformed like a JSON request's.
 			let mut body = bytes;
-			let mut model = model_router::multipart_model(&body, &boundary).await.ok();
+			let mut model = model_router::multipart_model(&body, &boundary, parts.uri.path())
+				.await
+				.ok();
 			// Body mutations (`transformation`, `overrides`, `defaults`) are defined over a JSON object,
 			// such as `model: llmRequest.model.stripPrefix("openai/")`. To reuse them, we evaluate them
 			// against a stand-in object holding only the form's `model`. Of the result we only take

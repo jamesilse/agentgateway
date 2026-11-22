@@ -1060,8 +1060,14 @@ async fn requested_model(req: &mut Request) -> RouterResult<RequestedModel> {
 	}
 
 	if let Some(boundary) = multipart_boundary(req) {
+		let path = req
+			.extensions()
+			.get::<crate::http::filters::OriginalUrl>()
+			.map(|original| original.0.path())
+			.unwrap_or(req.uri().path())
+			.to_string();
 		let body = body_bytes(req).await?;
-		let model = multipart_model(&body, &boundary).await?;
+		let model = multipart_model(&body, &boundary, &path).await?;
 		return Ok(RequestedModel {
 			model,
 			location: RequestedModelLocation::Multipart,
@@ -1251,9 +1257,16 @@ pub(crate) async fn rewrite_multipart_request_model(
 	Ok(())
 }
 
-pub(crate) async fn multipart_model(body: &Bytes, boundary: &str) -> RouterResult<String> {
+pub(crate) async fn multipart_model(
+	body: &Bytes,
+	boundary: &str,
+	path: &str,
+) -> RouterResult<String> {
 	let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(body.clone())));
 	let mut multipart = multer::Multipart::new(stream, boundary);
+	let realtime = path.ends_with("/realtime/calls") || path.ends_with("/v1/live");
+	let mut model = None;
+	let mut session = None;
 	while let Some(field) = multipart.next_field().await.map_err(|err| {
 		tracing::debug!(%err, "failed to parse LLM multipart request body");
 		Box::new(llm_error_response(
@@ -1262,22 +1275,58 @@ pub(crate) async fn multipart_model(body: &Bytes, boundary: &str) -> RouterResul
 			"invalid_request_body",
 		))
 	})? {
-		if field.name() == Some("model") {
-			return field.text().await.map_err(|err| {
+		if field.name() == Some("model") && model.is_none() {
+			let value = field.text().await.map_err(|err| {
 				tracing::debug!(%err, "failed to parse LLM multipart model field");
 				Box::new(llm_error_response(
 					::http::StatusCode::BAD_REQUEST,
 					"LLM multipart request body has invalid string field 'model'",
 					"invalid_model",
 				))
-			});
+			})?;
+			if !realtime {
+				return Ok(value);
+			}
+			model = Some(value);
+		} else if realtime && field.name() == Some("session") {
+			if session.is_some() {
+				return Err(Box::new(llm_error_response(
+					::http::StatusCode::BAD_REQUEST,
+					"LLM multipart request body has more than one 'session' part",
+					"invalid_request_body",
+				)));
+			}
+			let data = field.bytes().await.map_err(|err| {
+				tracing::debug!(%err, "failed to read LLM multipart session field");
+				Box::new(llm_error_response(
+					::http::StatusCode::BAD_REQUEST,
+					"LLM multipart request body must be valid multipart/form-data",
+					"invalid_request_body",
+				))
+			})?;
+			session = Some(session_model(&data));
 		}
 	}
-	Err(Box::new(llm_error_response(
-		::http::StatusCode::BAD_REQUEST,
-		"LLM multipart request body is missing string field 'model'",
-		"missing_model",
-	)))
+	match (model, session) {
+		(Some(model), Some(Some(session))) if model != session => Err(Box::new(llm_error_response(
+			::http::StatusCode::BAD_REQUEST,
+			"LLM multipart request body has field 'model' that does not match the model in its 'session' part",
+			"invalid_model",
+		))),
+		(Some(model), _) | (None, Some(Some(model))) => Ok(model),
+		(None, session) => {
+			let location = if session.is_some() {
+				" in its 'session' part"
+			} else {
+				""
+			};
+			Err(Box::new(llm_error_response(
+				::http::StatusCode::BAD_REQUEST,
+				&format!("LLM multipart request body for {path} is missing string field 'model'{location}"),
+				"missing_model",
+			)))
+		},
+	}
 }
 
 pub(crate) async fn rewrite_multipart_body_model(
@@ -1290,6 +1339,7 @@ pub(crate) async fn rewrite_multipart_body_model(
 	let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(body.clone())));
 	let mut multipart = multer::Multipart::new(stream, boundary);
 	let mut original = None;
+	let mut sessions = Vec::new();
 	while let Some(field) = multipart.next_field().await.map_err(|err| {
 		tracing::debug!(%err, "failed to parse LLM multipart request body for model rewrite");
 		Box::new(llm_error_response(
@@ -1298,6 +1348,24 @@ pub(crate) async fn rewrite_multipart_body_model(
 			"invalid_request_body",
 		))
 	})? {
+		if field.name() == Some("session") {
+			let data = field.bytes().await.map_err(|err| {
+				tracing::debug!(%err, "failed to read LLM multipart session field for rewrite");
+				Box::new(llm_error_response(
+					::http::StatusCode::BAD_REQUEST,
+					"LLM multipart request body must be valid multipart/form-data",
+					"invalid_request_body",
+				))
+			})?;
+			if let Some(model) = session_model(&data)
+				&& model != target
+				&& original.is_none()
+			{
+				original = Some(model);
+			}
+			sessions.push(rewrite_session(&data, target));
+			continue;
+		}
 		if field.name() != Some("model") {
 			continue;
 		}
@@ -1316,6 +1384,7 @@ pub(crate) async fn rewrite_multipart_body_model(
 	let Some(original) = original else {
 		return Ok(None);
 	};
+	let mut sessions = sessions.into_iter();
 
 	// Multer does not expose raw offsets, so rebuild the multipart envelope from the fields it
 	// parsed. File and non-model field bytes are preserved; header formatting is normalized.
@@ -1331,6 +1400,11 @@ pub(crate) async fn rewrite_multipart_body_model(
 		))
 	})? {
 		let is_model = field.name() == Some("model");
+		let new_session = if field.name() == Some("session") {
+			sessions.next().flatten()
+		} else {
+			None
+		};
 		rewritten.extend_from_slice(b"--");
 		rewritten.extend_from_slice(boundary.as_bytes());
 		rewritten.extend_from_slice(b"\r\n");
@@ -1342,6 +1416,10 @@ pub(crate) async fn rewrite_multipart_body_model(
 				rewritten.extend_from_slice(b"text/plain; charset=utf-8");
 			} else if is_model && name == ::http::header::CONTENT_LENGTH {
 				rewritten.extend_from_slice(target.len().to_string().as_bytes());
+			} else if let Some(data) = &new_session
+				&& name == ::http::header::CONTENT_LENGTH
+			{
+				rewritten.extend_from_slice(data.len().to_string().as_bytes());
 			} else {
 				rewritten.extend_from_slice(value.as_bytes());
 			}
@@ -1368,7 +1446,7 @@ pub(crate) async fn rewrite_multipart_body_model(
 					"invalid_request_body",
 				))
 			})?;
-			rewritten.extend_from_slice(&data);
+			rewritten.extend_from_slice(new_session.as_ref().unwrap_or(&data));
 		}
 		rewritten.extend_from_slice(b"\r\n");
 	}
@@ -1376,6 +1454,23 @@ pub(crate) async fn rewrite_multipart_body_model(
 	rewritten.extend_from_slice(boundary.as_bytes());
 	rewritten.extend_from_slice(b"--\r\n");
 	Ok(Some((Bytes::from(rewritten), original)))
+}
+
+fn session_model(session: &[u8]) -> Option<String> {
+	serde_json::from_slice::<Value>(session)
+		.ok()?
+		.get("model")?
+		.as_str()
+		.map(ToString::to_string)
+}
+
+fn rewrite_session(session: &[u8], target: &str) -> Option<Bytes> {
+	let mut session = serde_json::from_slice::<Value>(session).ok()?;
+	let model = session
+		.get_mut("model")
+		.filter(|model| model.as_str().is_some_and(|model| model != target))?;
+	*model = Value::String(target.to_string());
+	serde_json::to_vec(&session).ok().map(Bytes::from)
 }
 
 async fn body_bytes(req: &mut Request) -> RouterResult<Bytes> {
@@ -2352,6 +2447,260 @@ mod tests {
 			.await
 			.expect("multipart body should parse");
 		assert!(rewritten.is_none());
+	}
+
+	fn realtime_call_body(session: &str) -> Bytes {
+		Bytes::from(format!(
+			concat!(
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"sdp\"\r\n",
+				"Content-Type: application/sdp\r\n",
+				"\r\n",
+				"v=offer\r\n",
+				"\r\n",
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"session\"\r\n",
+				"Content-Type: application/json\r\n",
+				"Content-Length: {}\r\n",
+				"\r\n",
+				"{}\r\n",
+				"--realtime-boundary--\r\n",
+			),
+			session.len(),
+			session,
+		))
+	}
+
+	async fn error_message(resp: Response, code: &str) -> String {
+		let body = http::read_body_with_limit(resp.into_body(), 1024)
+			.await
+			.expect("error body");
+		let body: Value = serde_json::from_slice(&body).expect("error JSON");
+		assert_eq!(body["error"]["code"], code);
+		body["error"]["message"]
+			.as_str()
+			.expect("error message")
+			.to_string()
+	}
+
+	#[tokio::test]
+	async fn multipart_model_reads_realtime_session_model() {
+		let body = realtime_call_body(r#"{"type":"realtime","model":"gpt-realtime"}"#);
+		let model = multipart_model(&body, "realtime-boundary", "/v1/live")
+			.await
+			.expect("session model");
+		assert_eq!(model, "gpt-realtime");
+	}
+
+	#[tokio::test]
+	async fn multipart_model_requires_model_field_to_match_session() {
+		let body = |model: &str| {
+			Bytes::from(format!(
+				concat!(
+					"--realtime-boundary\r\n",
+					"Content-Disposition: form-data; name=\"session\"\r\n",
+					"\r\n",
+					"{{\"model\":\"session-model\"}}\r\n",
+					"--realtime-boundary\r\n",
+					"Content-Disposition: form-data; name=\"model\"\r\n",
+					"\r\n",
+					"{}\r\n",
+					"--realtime-boundary--\r\n",
+				),
+				model
+			))
+		};
+		let model = multipart_model(
+			&body("session-model"),
+			"realtime-boundary",
+			"/v1/realtime/calls",
+		)
+		.await
+		.expect("matching models");
+		assert_eq!(model, "session-model");
+
+		let resp = *multipart_model(
+			&body("form-model"),
+			"realtime-boundary",
+			"/v1/realtime/calls",
+		)
+		.await
+		.expect_err("conflicting models");
+		assert_eq!(
+			error_message(resp, "invalid_model").await,
+			"LLM multipart request body has field 'model' that does not match the model in its 'session' part"
+		);
+	}
+
+	#[tokio::test]
+	async fn multipart_model_rejects_repeated_session_parts() {
+		let body = Bytes::from_static(
+			concat!(
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"session\"\r\n",
+				"\r\n",
+				"{\"model\":\"first-model\"}\r\n",
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"session\"\r\n",
+				"\r\n",
+				"{\"model\":\"second-model\"}\r\n",
+				"--realtime-boundary--\r\n",
+			)
+			.as_bytes(),
+		);
+		let resp = *multipart_model(&body, "realtime-boundary", "/v1/live")
+			.await
+			.expect_err("repeated session parts");
+		assert_eq!(
+			error_message(resp, "invalid_request_body").await,
+			"LLM multipart request body has more than one 'session' part"
+		);
+	}
+
+	#[tokio::test]
+	async fn multipart_model_ignores_session_outside_realtime_calls() {
+		let body = realtime_call_body(r#"{"model":"gpt-image"}"#);
+		let resp = *multipart_model(&body, "realtime-boundary", "/v1/images/edits")
+			.await
+			.expect_err("model is missing");
+		assert_eq!(
+			error_message(resp, "missing_model").await,
+			"LLM multipart request body for /v1/images/edits is missing string field 'model'"
+		);
+	}
+
+	#[tokio::test]
+	async fn multipart_model_missing_model_names_path_and_field() {
+		let body = Bytes::from_static(
+			concat!(
+				"--audio-boundary\r\n",
+				"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+				"\r\n",
+				"audio-bytes\r\n",
+				"--audio-boundary--\r\n",
+			)
+			.as_bytes(),
+		);
+		let resp = *multipart_model(&body, "audio-boundary", "/v1/audio/transcriptions")
+			.await
+			.expect_err("model is missing");
+		assert_eq!(
+			error_message(resp, "missing_model").await,
+			"LLM multipart request body for /v1/audio/transcriptions is missing string field 'model'"
+		);
+
+		for session in [r#"{"type":"realtime"}"#, r#"{"model":7}"#, "not json"] {
+			let resp = *multipart_model(
+				&realtime_call_body(session),
+				"realtime-boundary",
+				"/v1/realtime/calls",
+			)
+			.await
+			.expect_err("session model is missing");
+			assert_eq!(
+				error_message(resp, "missing_model").await,
+				"LLM multipart request body for /v1/realtime/calls is missing string field 'model' in its 'session' part",
+				"{session}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn rewrite_multipart_body_model_rewrites_session_model() {
+		let body = realtime_call_body(r#"{"type":"realtime","model":"public-model"}"#);
+		let (rewritten, original) =
+			rewrite_multipart_body_model(&body, "realtime-boundary", "upstream-model")
+				.await
+				.expect("multipart body should parse")
+				.expect("session model should change");
+		assert_eq!(original, "public-model");
+
+		let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(rewritten)));
+		let mut multipart = multer::Multipart::new(stream, "realtime-boundary");
+		let sdp = multipart
+			.next_field()
+			.await
+			.expect("rewritten multipart body should parse")
+			.expect("sdp field");
+		assert_eq!(sdp.name(), Some("sdp"));
+		assert_eq!(
+			sdp.bytes().await.expect("sdp bytes").as_ref(),
+			b"v=offer\r\n"
+		);
+		let session = multipart
+			.next_field()
+			.await
+			.expect("rewritten multipart body should parse")
+			.expect("session field");
+		assert_eq!(session.name(), Some("session"));
+		let content_length = session
+			.headers()
+			.get(::http::header::CONTENT_LENGTH)
+			.and_then(|value| value.to_str().ok())
+			.map(ToString::to_string);
+		let session = session.bytes().await.expect("session bytes");
+		assert_eq!(content_length, Some(session.len().to_string()));
+		let session: Value = serde_json::from_slice(&session).expect("session JSON");
+		assert_eq!(
+			session,
+			serde_json::json!({"type": "realtime", "model": "upstream-model"})
+		);
+		assert!(
+			multipart
+				.next_field()
+				.await
+				.expect("rewritten multipart body should parse")
+				.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn rewrite_multipart_body_model_rewrites_model_field_and_every_session() {
+		let body = Bytes::from_static(
+			concat!(
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"session\"\r\n",
+				"\r\n",
+				"{\"model\":\"public-model\"}\r\n",
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"model\"\r\n",
+				"\r\n",
+				"public-model\r\n",
+				"--realtime-boundary\r\n",
+				"Content-Disposition: form-data; name=\"session\"\r\n",
+				"\r\n",
+				"{\"model\":\"other-model\"}\r\n",
+				"--realtime-boundary--\r\n",
+			)
+			.as_bytes(),
+		);
+		let (rewritten, original) =
+			rewrite_multipart_body_model(&body, "realtime-boundary", "upstream-model")
+				.await
+				.expect("multipart body should parse")
+				.expect("models should change");
+		assert_eq!(original, "public-model");
+
+		let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(rewritten)));
+		let mut multipart = multer::Multipart::new(stream, "realtime-boundary");
+		let mut fields = Vec::new();
+		while let Some(field) = multipart
+			.next_field()
+			.await
+			.expect("rewritten multipart body should parse")
+		{
+			let name = field.name().expect("named field").to_string();
+			fields.push((name, field.bytes().await.expect("field bytes")));
+		}
+		let session = Bytes::from_static(br#"{"model":"upstream-model"}"#);
+		assert_eq!(
+			fields,
+			vec![
+				("session".to_string(), session.clone()),
+				("model".to_string(), Bytes::from_static(b"upstream-model")),
+				("session".to_string(), session),
+			]
+		);
 	}
 
 	#[tokio::test]

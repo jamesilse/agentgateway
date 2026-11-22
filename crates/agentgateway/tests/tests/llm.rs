@@ -1665,6 +1665,161 @@ llm:
 }
 
 #[tokio::test]
+async fn llm_model_router_routes_realtime_call_by_session_model() {
+	let mock = body_mock(b"v=answer\r\n").await;
+	let config = format!(
+		r#"
+llm:
+  port: 0
+  models:
+  - name: "*"
+    provider: openAI
+    params:
+      baseUrl: http://{}/v1
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+
+	for (i, (path, query)) in [
+		("/v1/live", None),
+		(
+			"/v1/realtime/calls",
+			Some("intent=quicksilver&architecture=avas"),
+		),
+	]
+	.into_iter()
+	.enumerate()
+	{
+		let uri = query.map_or(path.to_string(), |query| format!("{path}?{query}"));
+		let io = t.serve_http(strng::literal!("bind/0"));
+		let body = realtime_call_body("gpt-realtime");
+		let res = send_realtime_call(io, &uri, body.clone()).await;
+		assert_eq!(res.status(), StatusCode::OK, "{uri}");
+		let _ = read_body_raw(res.into_body()).await;
+
+		let requests = mock
+			.received_requests()
+			.await
+			.expect("request recording should be enabled");
+		assert_eq!(requests.len(), i + 1, "{uri}");
+		assert_eq!(requests[i].url.path(), path);
+		assert_eq!(requests[i].url.query(), query);
+		assert_eq!(requests[i].body, body, "{uri}");
+	}
+}
+
+#[tokio::test]
+async fn llm_model_router_rewrites_virtual_realtime_session_model() {
+	let mock = body_mock(b"v=answer\r\n").await;
+	let config = format!(
+		r#"
+llm:
+  port: 0
+  models:
+  - name: real-model
+    visibility: internal
+    provider: openAI
+    params:
+      baseUrl: http://{}/v1
+  virtualModels:
+  - name: public-model
+    routing:
+      failover:
+        targets:
+        - model: real-model
+          priority: 0
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	let io = t.serve_http(strng::literal!("bind/0"));
+
+	let res = send_realtime_call(io, "/v1/live", realtime_call_body("public-model")).await;
+	assert_eq!(res.status(), StatusCode::OK);
+	let _ = read_body_raw(res.into_body()).await;
+
+	let requests = mock
+		.received_requests()
+		.await
+		.expect("request recording should be enabled");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(requests[0].url.path(), "/v1/live");
+	let stream = futures_util::stream::once(std::future::ready(Ok::<bytes::Bytes, multer::Error>(
+		bytes::Bytes::copy_from_slice(&requests[0].body),
+	)));
+	let mut multipart = multer::Multipart::new(stream, "realtime-call-boundary");
+	let mut fields = Vec::new();
+	while let Some(field) = multipart
+		.next_field()
+		.await
+		.expect("upstream multipart body should parse")
+	{
+		let name = field.name().expect("field should be named").to_string();
+		let data = field.bytes().await.expect("field should read");
+		fields.push((name, data));
+	}
+	assert_eq!(fields.len(), 2);
+	assert_eq!(fields[0].0, "sdp");
+	assert_eq!(fields[0].1.as_ref(), b"v=offer\r\n");
+	assert_eq!(fields[1].0, "session");
+	let session: Value = serde_json::from_slice(&fields[1].1).expect("session should be JSON");
+	assert_eq!(
+		session,
+		json!({"type": "realtime", "model": "real-model", "audio": {"output": {"voice": "marin"}}})
+	);
+}
+
+#[tokio::test]
+async fn llm_model_router_rejects_realtime_call_without_session_model() {
+	let mock = body_mock(b"v=answer\r\n").await;
+	let config = format!(
+		r#"
+llm:
+  port: 0
+  models:
+  - name: "*"
+    provider: openAI
+    params:
+      baseUrl: http://{}/v1
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	let io = t.serve_http(strng::literal!("bind/0"));
+
+	let body = concat!(
+		"--realtime-call-boundary\r\n",
+		"Content-Disposition: form-data; name=\"sdp\"\r\n",
+		"Content-Type: application/sdp\r\n",
+		"\r\n",
+		"v=offer\r\n",
+		"\r\n",
+		"--realtime-call-boundary\r\n",
+		"Content-Disposition: form-data; name=\"session\"\r\n",
+		"Content-Type: application/json\r\n",
+		"\r\n",
+		"{\"type\":\"realtime\"}\r\n",
+		"--realtime-call-boundary--\r\n",
+	);
+	let res = send_realtime_call(io, "/v1/live", body.as_bytes().to_vec()).await;
+	assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+	let body: Value = serde_json::from_slice(&read_body_raw(res.into_body()).await).unwrap();
+	assert_eq!(
+		body["error"]["message"],
+		"LLM multipart request body for /v1/live is missing string field 'model' in its 'session' part"
+	);
+	assert_eq!(body["error"]["code"], "missing_model");
+	assert!(
+		mock
+			.received_requests()
+			.await
+			.expect("request recording should be enabled")
+			.is_empty()
+	);
+}
+
+#[tokio::test]
 async fn llm_custom_rerank() {
 	let mock = body_mock(llm_body!("response/cohere/rerank.json")).await;
 	let provider = agentgateway::types::local::LocalNamedAIProvider {
@@ -2056,6 +2211,39 @@ async fn assert_multipart_audio_body(body: &[u8], expected_model: &str) {
 	}
 	assert!(saw_file, "multipart body should include the file field");
 	assert!(saw_model, "multipart body should include the model field");
+}
+
+fn realtime_call_body(model: &str) -> Vec<u8> {
+	format!(
+		concat!(
+			"--realtime-call-boundary\r\n",
+			"Content-Disposition: form-data; name=\"sdp\"\r\n",
+			"Content-Type: application/sdp\r\n",
+			"\r\n",
+			"v=offer\r\n",
+			"\r\n",
+			"--realtime-call-boundary\r\n",
+			"Content-Disposition: form-data; name=\"session\"\r\n",
+			"Content-Type: application/json\r\n",
+			"\r\n",
+			"{{\"type\":\"realtime\",\"model\":\"{}\",\"audio\":{{\"output\":{{\"voice\":\"marin\"}}}}}}\r\n",
+			"--realtime-call-boundary--\r\n",
+		),
+		model,
+	)
+	.into_bytes()
+}
+
+async fn send_realtime_call(io: MemoryClient, path: &str, body: Vec<u8>) -> Response {
+	RequestBuilder::new(Method::POST, &format!("http://lo{path}"))
+		.header(
+			header::CONTENT_TYPE,
+			"multipart/form-data; boundary=realtime-call-boundary",
+		)
+		.body(Body::from(body))
+		.send(io)
+		.await
+		.expect("realtime call request")
 }
 
 async fn send_multipart_audio(io: MemoryClient, body: Vec<u8>) -> Response {
