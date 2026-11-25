@@ -769,6 +769,18 @@ impl Policy {
 		);
 	}
 
+	/// The model `overrides` sends upstream, replacing the provider's model. A `model` transformation
+	/// reads the request before overrides are written and replaces their result.
+	pub fn overridden_model(
+		overrides: Option<&HashMap<String, serde_json::Value>>,
+		transformations: Option<&HashMap<String, Arc<cel::Expression>>>,
+	) -> Option<Strng> {
+		if transformations.is_some_and(|t| t.contains_key("model")) {
+			return None;
+		}
+		overrides?.get("model")?.as_str().map(strng::new)
+	}
+
 	pub fn resolve_model_alias(&self, model: &str) -> Option<&Strng> {
 		// Fast path: exact match in HashMap (O(1))
 		if let Some(target) = self.model_aliases.get(model) {

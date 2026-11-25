@@ -940,6 +940,23 @@ llm:
     params:
       model: priced
       baseUrl: http://{0}/v1
+  - name: unlisted
+    visibility: internal
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    params:
+      baseUrl: http://{0}/v1
+  - name: pre/*
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    params:
+      baseUrl: http://{0}/v1
+    transformation:
+      model: llmRequest.model.stripPrefix("pre/")
   - name: "*"
     provider: openAI
     authorization:
@@ -947,6 +964,25 @@ llm:
       - 'llm.costStatus != "missing"'
     params:
       baseUrl: http://{0}/v1
+  virtualModels:
+  - name: weighted
+    routing:
+      weighted:
+        targets:
+        - model: fast
+          weight: 1
+  - name: failover-priced
+    routing:
+      failover:
+        targets:
+        - model: fast
+          priority: 0
+  - name: failover-missing
+    routing:
+      failover:
+        targets:
+        - model: unlisted
+          priority: 0
 "#,
 		mock.address()
 	);
@@ -962,19 +998,125 @@ llm:
 	let io = t.serve_http(strng::literal!("bind/0"));
 
 	let models = list_models(io.clone(), &[]).await;
-	for model in ["fast", "free", "priced"] {
+	for model in ["fast", "free", "priced", "pre/priced"] {
 		assert!(models.iter().any(|m| m == model), "{model} listed");
 	}
+	for model in ["unknown", "unlisted"] {
+		assert!(!models.iter().any(|m| m == model), "{model} not listed");
+	}
+	let res = send_request(io.clone(), Method::GET, "http://lo/v1/models/unknown").await;
+	assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
 	for (model, status) in [
 		("priced", StatusCode::OK),
 		("free", StatusCode::OK),
 		("fast", StatusCode::OK),
 		("unknown", StatusCode::FORBIDDEN),
+		("pre/priced", StatusCode::OK),
+		("pre/priced-2024-08-06", StatusCode::OK),
+		("pre/unknown", StatusCode::FORBIDDEN),
+		("weighted", StatusCode::OK),
+		("failover-priced", StatusCode::OK),
+		("failover-missing", StatusCode::FORBIDDEN),
 	] {
 		let res = send_completions_with_model(io.clone(), model, &[]).await;
 		assert_eq!(res.status(), status, "{model}");
 	}
-	assert_eq!(mock.received_requests().await.unwrap().len(), 3);
+	assert_eq!(mock.received_requests().await.unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn llm_local_router_cost_status_uses_overridden_model() {
+	let mock = body_mock(llm_body!("response/completions/basic.json")).await;
+	let config = format!(
+		r#"
+llm:
+  port: 0
+  models:
+  - name: overridden
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    overrides:
+      model: priced
+    params:
+      baseUrl: http://{0}/v1
+  - name: priced
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    overrides:
+      model: unknown
+    params:
+      baseUrl: http://{0}/v1
+  - name: both
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    overrides:
+      model: priced
+    params:
+      model: unknown
+      baseUrl: http://{0}/v1
+  - name: both-unknown
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    overrides:
+      model: unknown
+    params:
+      model: priced
+      baseUrl: http://{0}/v1
+  - name: transformed/*
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    overrides:
+      model: unknown
+    params:
+      baseUrl: http://{0}/v1
+    transformation:
+      model: llmRequest.model.stripPrefix("transformed/")
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	t.pi
+		.model_catalog
+		.replace_sources(vec![agentgateway::ModelCatalogSource::Inline {
+			inline:
+				r#"{"providers":{"openai":{"models":{"priced":{"rates":{"input":"1","output":"2"}}}}}}"#
+					.to_string(),
+		}])
+		.await
+		.expect("inline catalog loads");
+	let io = t.serve_http(strng::literal!("bind/0"));
+
+	for (model, status) in [
+		("overridden", StatusCode::OK),
+		("priced", StatusCode::FORBIDDEN),
+		("both", StatusCode::OK),
+		("both-unknown", StatusCode::FORBIDDEN),
+		("transformed/priced", StatusCode::OK),
+	] {
+		let res = send_completions_with_model(io.clone(), model, &[]).await;
+		assert_eq!(res.status(), status, "{model}");
+	}
+	let upstream_models: Vec<_> = mock
+		.received_requests()
+		.await
+		.expect("upstream requests")
+		.iter()
+		.map(|req| {
+			serde_json::from_slice::<Value>(&req.body).expect("upstream request JSON")["model"].clone()
+		})
+		.collect();
+	assert_eq!(upstream_models, vec!["priced", "priced", "priced"]);
 }
 
 #[tokio::test]

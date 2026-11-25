@@ -47,6 +47,29 @@ impl ModelTransformation {
 				.try_fold(model, |model, step| step.apply(model)),
 		}
 	}
+
+	/// Recovers the provider model from a public name. Like the CEL functions it mirrors, removing
+	/// an affix that is absent leaves the name unchanged.
+	pub fn unapply<'a>(&self, model: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
+		let model = model.into();
+		match self {
+			Self::Identity => model,
+			Self::Prefix(prefix) => match model.strip_prefix(prefix.as_str()) {
+				Some(stripped) => Cow::Owned(stripped.to_owned()),
+				None => model,
+			},
+			Self::Suffix(suffix) => match model.strip_suffix(suffix.as_str()) {
+				Some(stripped) => Cow::Owned(stripped.to_owned()),
+				None => model,
+			},
+			Self::StripPrefix(prefix) => Cow::Owned(format!("{prefix}{model}")),
+			Self::StripSuffix(suffix) => Cow::Owned(format!("{model}{suffix}")),
+			Self::Chain(steps) => steps
+				.iter()
+				.rev()
+				.fold(model, |model, step| step.unapply(model)),
+		}
+	}
 }
 
 /// Compile a supported CEL model transformation into reverse operations during
@@ -211,5 +234,78 @@ mod tests {
 				"recovered model must transform back to the upstream model"
 			);
 		}
+	}
+
+	#[rstest]
+	#[case::identity("llmRequest.model", "gpt-4o", "gpt-4o")]
+	#[case::strip_prefix("llmRequest.model.stripPrefix('openai/')", "openai/gpt-4o", "gpt-4o")]
+	#[case::strip_suffix("llmRequest.model.stripSuffix('-public')", "gpt-4o-public", "gpt-4o")]
+	#[case::add_prefix("'openai/' + llmRequest.model", "gpt-4o", "openai/gpt-4o")]
+	#[case::add_suffix("llmRequest.model + '-latest'", "gpt-4o", "gpt-4o-latest")]
+	#[case::rename_prefix(
+		"'vendor/' + llmRequest.model.stripPrefix('public/')",
+		"public/gpt-4o",
+		"vendor/gpt-4o"
+	)]
+	#[case::strip_both(
+		"llmRequest.model.stripPrefix('openai/').stripSuffix('-public')",
+		"openai/gpt-4o-public",
+		"gpt-4o"
+	)]
+	#[case::not_in_catalog(
+		"llmRequest.model.stripPrefix('openai/')",
+		"openai/gpt-4o-2024-08-06",
+		"gpt-4o-2024-08-06"
+	)]
+	fn unapply_recovers_upstream_model(
+		#[case] expression: &str,
+		#[case] public_model: &str,
+		#[case] upstream_model: &str,
+	) {
+		let expression = crate::cel::Expression::new_strict(expression).unwrap();
+		let transformation = reverse_model_transformation(&expression).unwrap();
+		assert_eq!(transformation.unapply(public_model), upstream_model);
+		assert_eq!(
+			transformation.apply(upstream_model).as_deref(),
+			Some(public_model)
+		);
+	}
+
+	#[rstest]
+	#[case::missing_prefix(
+		"llmRequest.model.stripPrefix('openai/').stripSuffix('-public')",
+		"gpt-4o-public",
+		"gpt-4o"
+	)]
+	#[case::missing_suffix(
+		"llmRequest.model.stripPrefix('openai/').stripSuffix('-public')",
+		"openai/gpt-4o",
+		"gpt-4o"
+	)]
+	#[case::missing_both(
+		"llmRequest.model.stripPrefix('openai/').stripSuffix('-public')",
+		"gpt-4o",
+		"gpt-4o"
+	)]
+	#[case::single_step("llmRequest.model.stripPrefix('openai/')", "gpt-4o", "gpt-4o")]
+	#[case::strip_then_add(
+		"'vendor/' + llmRequest.model.stripPrefix('public/')",
+		"gpt-4o",
+		"vendor/gpt-4o"
+	)]
+	fn unapply_skips_absent_affixes(
+		#[case] expression: &str,
+		#[case] public_model: &str,
+		#[case] upstream_model: &str,
+	) {
+		let expression = crate::cel::Expression::new_strict(expression).unwrap();
+		let transformation = reverse_model_transformation(&expression).unwrap();
+		assert_eq!(transformation.unapply(public_model), upstream_model);
+		let request = serde_json::json!({"model": public_model});
+		let executor = crate::cel::Executor::new_llm(None, &request);
+		assert_eq!(
+			executor.eval(&expression).unwrap().json().unwrap(),
+			serde_json::json!(upstream_model),
+		);
 	}
 }

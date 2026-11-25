@@ -55,22 +55,16 @@ impl ModelDiscovery {
 	}
 
 	/// Finds the catalog model ID backing a served name.
-	pub fn catalog_model<'a>(&self, served: &str, mut ids: impl Iterator<Item = &'a str>) -> String {
+	pub fn catalog_model(&self, served: &str, catalog: &CatalogSnapshot) -> String {
 		// A fixed model replaces the served name before the transformation runs.
 		let target = self.model.as_deref().unwrap_or(served);
-		if !matches!(self.transformation, ModelTransformation::Identity)
-			&& let Some(id) = ids.find(|id| {
-				self
-					.transformation
-					.apply(*id)
-					.is_some_and(|name| name == target)
-			}) {
-			return id.to_owned();
+		// A name the catalog cannot resolve is kept as is.
+		let id = self.transformation.unapply(target);
+		if catalog.model(&self.provider, &id).is_some() {
+			id.into_owned()
+		} else {
+			target.to_string()
 		}
-		// Otherwise the target is the upstream model: either there is no transformation, or it left
-		// the name unchanged (e.g. stripPrefix without the prefix). The catalog resolves provider
-		// aliases such as Vertex publisher prefixes.
-		target.to_string()
 	}
 
 	/// Client endpoints the gateway fully parses for the model, preferring those served natively.

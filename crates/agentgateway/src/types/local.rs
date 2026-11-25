@@ -5070,7 +5070,11 @@ async fn convert_llm_config(
 
 		let discovery = llm::discovery::ModelDiscovery::new(
 			provider.provider(),
-			provider.override_model(),
+			llm::Policy::overridden_model(
+				model_config.overrides.as_ref(),
+				model_config.transformation.as_ref(),
+			)
+			.or_else(|| provider.override_model()),
 			model_config
 				.transformation
 				.as_ref()

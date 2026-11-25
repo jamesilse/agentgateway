@@ -2717,6 +2717,20 @@ async fn make_backend_call(
 				.stores
 				.read_binds()
 				.sub_backend_policies(sub_backend_name, Some(&provider.inline_policies));
+			if model_route_type.is_some()
+				&& req
+					.extensions()
+					.get::<model_router::ModelCostStatus>()
+					.is_none()
+				&& let Some(status) = model_router::provider_cost_status(
+					&provider.provider,
+					sub_backend_policies.llm.as_deref(),
+					&inputs.model_catalog.snapshot(),
+				) {
+				req
+					.extensions_mut()
+					.insert(model_router::ModelCostStatus(status));
+			}
 
 			let provider_defaults = BackendPolicies {
 				health: ai.default_health.clone(),

@@ -913,9 +913,26 @@ fn cost_status(
 	catalog: &llm::catalog::CatalogSnapshot,
 ) -> Option<llm::catalog::CostLookupStatus> {
 	let discovery = model.discovery.as_ref()?;
+	Some(catalog.cost_status(&discovery.provider, &discovery.catalog_model(name, catalog)))
+}
+
+pub(crate) fn provider_cost_status(
+	provider: &llm::AIProvider,
+	policy: Option<&llm::Policy>,
+	catalog: &llm::catalog::CatalogSnapshot,
+) -> Option<llm::catalog::CostLookupStatus> {
+	let model = provider.override_model()?;
+	let discovery = llm::discovery::ModelDiscovery::new(
+		provider.provider(),
+		None,
+		policy
+			.and_then(|p| p.transformations.as_ref())
+			.and_then(|p| p.get("model"))
+			.map(AsRef::as_ref),
+	)?;
 	Some(catalog.cost_status(
 		&discovery.provider,
-		&catalog_model(discovery, name, catalog),
+		&discovery.catalog_model(&model, catalog),
 	))
 }
 
@@ -953,23 +970,12 @@ fn model_info(
 	let Some(discovery) = &route.discovery else {
 		return llm::model_list::ModelInfo::new(name, route.created, None, None);
 	};
-	let id = catalog_model(discovery, &name, catalog);
+	let id = discovery.catalog_model(&name, catalog);
 	let entry = catalog.model(&discovery.provider, &id);
 	llm::model_list::ModelInfo {
 		preferred_endpoints: discovery.preferred_endpoints(&id, catalog),
 		..llm::model_list::ModelInfo::new(name, route.created, Some(discovery.provider.clone()), entry)
 	}
-}
-
-fn catalog_model(
-	discovery: &llm::discovery::ModelDiscovery,
-	name: &str,
-	catalog: &llm::catalog::CatalogSnapshot,
-) -> String {
-	catalog
-		.model_ids(&discovery.provider)
-		.map(|ids| discovery.catalog_model(name, ids))
-		.unwrap_or_else(|| discovery.model.as_deref().unwrap_or(name).to_string())
 }
 
 fn is_responses_websocket(req: &Request) -> bool {

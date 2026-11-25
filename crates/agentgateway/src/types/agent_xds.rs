@@ -1839,7 +1839,11 @@ impl ModelRoute {
 							.map(|(provider, _)| provider);
 						llm::discovery::ModelDiscovery::new(
 							strng::new(provider),
-							provider_config.as_ref().and_then(|p| p.override_model()),
+							llm::Policy::overridden_model(
+								llm_policy.overrides.as_ref(),
+								llm_policy.transformations.as_ref(),
+							)
+							.or_else(|| provider_config.as_ref().and_then(|p| p.override_model())),
 							llm_policy
 								.transformations
 								.as_ref()
