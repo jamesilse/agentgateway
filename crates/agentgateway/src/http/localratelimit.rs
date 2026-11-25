@@ -438,6 +438,7 @@ mod policy_tests {
 			req.extensions_mut().insert(crate::cel::RequestModel {
 				request_model: model.into(),
 				original_model: model.into(),
+				cost_status: None,
 			});
 			req
 		};

@@ -1540,6 +1540,12 @@ pub struct RequestModel {
 	pub request_model: Strng,
 	#[dynamic(rename = "originalModel")]
 	pub original_model: Strng,
+	#[dynamic(
+		rename = "costStatus",
+		with_value = "cost_status_to_value",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub cost_status: Option<llm::catalog::CostLookupStatus>,
 }
 
 #[derive(Debug, Default)]

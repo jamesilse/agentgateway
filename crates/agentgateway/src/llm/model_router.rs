@@ -239,6 +239,9 @@ pub enum VirtualModelRouting {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OriginalModel(pub String);
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModelCostStatus(pub llm::catalog::CostLookupStatus);
+
 impl OriginalModel {
 	/// Records the client's model before a rewrite. A model router runs first, so keep its value:
 	/// that is the name the client actually sent.
@@ -465,7 +468,13 @@ impl ModelRouter {
 			.find(|model| model.name == requested_model.model)
 		{
 			return self
-				.resolve_virtual_model(virtual_model, req, requested_model.location, client)
+				.resolve_virtual_model(
+					virtual_model,
+					req,
+					requested_model.location,
+					catalog,
+					client,
+				)
 				.await;
 		}
 		tracing::trace!(
@@ -474,7 +483,7 @@ impl ModelRouter {
 			"unable to find declared virtual model; trying concrete model routes",
 		);
 
-		match self.resolve_concrete_model(&requested_model.model, false, req) {
+		match self.resolve_concrete_model(&requested_model.model, false, req, catalog) {
 			Ok(Some(route)) => ResolveResult::Backend(route),
 			Ok(None) => {
 				ResolveResult::Rejected(ProxyResponseReason::NotFound, model_not_found_response())
@@ -493,7 +502,6 @@ impl ModelRouter {
 			.models
 			.iter()
 			.filter(|model| model.visibility == ModelVisibility::Public)
-			.filter(|model| model_authorized(model, req))
 			.flat_map(|model| {
 				if expand
 					&& let Some(discovery) = &model.discovery
@@ -507,7 +515,9 @@ impl ModelRouter {
 						.filter_map(|id| Some((id, discovery.transformation.apply(id)?)))
 						.filter(|(_, name)| {
 							// Now check it still matches the model match (e.g 'foo/*') and we are authorized for this model
-							model_name_matches(&model.name, name) && api_key_model_authorized(req, name)
+							model_name_matches(&model.name, name)
+								&& api_key_model_authorized(req, name)
+								&& model_authorized(model, name, req, &catalog)
 						})
 						.map(|(id, name)| llm::model_list::ModelInfo {
 							preferred_endpoints: discovery.preferred_endpoints(id, &catalog),
@@ -521,6 +531,7 @@ impl ModelRouter {
 						.collect::<Vec<_>>()
 				} else {
 					api_key_discoverable_models(req, &model.name)
+						.filter(|name| model_authorized(model, name, req, &catalog))
 						.map(|name| model_info(model, name.to_owned(), &catalog))
 						.collect()
 				}
@@ -612,6 +623,7 @@ impl ModelRouter {
 		virtual_model: &VirtualModelRoute,
 		req: &mut Request,
 		location: RequestedModelLocation,
+		catalog: &llm::catalog::ModelCatalog,
 		client: &PolicyClient,
 	) -> ResolveResult {
 		let mut fields = Vec::new();
@@ -750,7 +762,7 @@ impl ModelRouter {
 		if let Err(resp) = Box::pin(rewrite_request_model(req, location, &target, fields)).await {
 			return ResolveResult::Rejected(ProxyResponseReason::InvalidRequest, *resp);
 		}
-		match self.resolve_concrete_model(&target, true, req) {
+		match self.resolve_concrete_model(&target, true, req, catalog) {
 			Ok(Some(route)) => ResolveResult::Backend(route),
 			Ok(None) => {
 				tracing::debug!(
@@ -789,7 +801,8 @@ impl ModelRouter {
 		&self,
 		requested_model: &str,
 		allow_internal: bool,
-		req: &Request,
+		req: &mut Request,
+		catalog: &llm::catalog::ModelCatalog,
 	) -> Result<Option<ResolvedBackend>, ()> {
 		// `models` can store things like `provider/*`. The concrete `requested_model` will be like `provider/real-model`.
 		let matches = |model: &ModelRoute| {
@@ -797,10 +810,11 @@ impl ModelRouter {
 				&& model_name_matches(&model.name, requested_model)
 				&& header_matches(&model.header_matches, req)
 		};
+		let catalog = catalog.snapshot();
 		let Some(model) = self
 			.models
 			.iter()
-			.find(|model| matches(model) && model_authorized(model, req))
+			.find(|model| matches(model) && model_authorized(model, requested_model, req, &catalog))
 		else {
 			return if self.models.iter().any(matches) {
 				Err(())
@@ -808,6 +822,9 @@ impl ModelRouter {
 				Ok(None)
 			};
 		};
+		if let Some(status) = cost_status(model, requested_model, &catalog) {
+			req.extensions_mut().insert(ModelCostStatus(status));
+		}
 		Ok(Some(ResolvedBackend {
 			backend: model.backend.clone(),
 			route_type: model
@@ -861,7 +878,12 @@ fn llm_error_response(status: ::http::StatusCode, message: &str, code: &str) -> 
 		.expect("LLM error response is valid")
 }
 
-fn model_authorized(model: &ModelRoute, req: &Request) -> bool {
+fn model_authorized(
+	model: &ModelRoute,
+	name: &str,
+	req: &Request,
+	catalog: &llm::catalog::CatalogSnapshot,
+) -> bool {
 	let rules = model
 		.policies
 		.authorization
@@ -871,11 +893,30 @@ fn model_authorized(model: &ModelRoute, req: &Request) -> bool {
 	if rules.is_empty() {
 		return true;
 	}
-	crate::http::authorization::HTTPAuthorizationSet::new(
-		crate::http::authorization::RuleSets::from_arcs(rules),
-	)
-	.apply(req)
-	.is_ok()
+	let request_model = strng::new(name);
+	let llm = cel::RequestModel {
+		original_model: req
+			.extensions()
+			.get::<OriginalModel>()
+			.map_or_else(|| request_model.clone(), |m| strng::new(&m.0)),
+		request_model,
+		cost_status: cost_status(model, name, catalog),
+	};
+	let mut exec = cel::Executor::new_request(req);
+	exec.llm = cel::LLMView::RequestModel(&llm);
+	crate::http::authorization::RuleSets::from_arcs(rules).validate(&exec)
+}
+
+fn cost_status(
+	model: &ModelRoute,
+	name: &str,
+	catalog: &llm::catalog::CatalogSnapshot,
+) -> Option<llm::catalog::CostLookupStatus> {
+	let discovery = model.discovery.as_ref()?;
+	Some(catalog.cost_status(
+		&discovery.provider,
+		&catalog_model(discovery, name, catalog),
+	))
 }
 
 fn api_key_model_authorized(req: &Request, model: &str) -> bool {
@@ -912,15 +953,23 @@ fn model_info(
 	let Some(discovery) = &route.discovery else {
 		return llm::model_list::ModelInfo::new(name, route.created, None, None);
 	};
-	let id = catalog
-		.model_ids(&discovery.provider)
-		.map(|ids| discovery.catalog_model(&name, ids))
-		.unwrap_or_else(|| discovery.model.as_deref().unwrap_or(&name).to_string());
+	let id = catalog_model(discovery, &name, catalog);
 	let entry = catalog.model(&discovery.provider, &id);
 	llm::model_list::ModelInfo {
 		preferred_endpoints: discovery.preferred_endpoints(&id, catalog),
 		..llm::model_list::ModelInfo::new(name, route.created, Some(discovery.provider.clone()), entry)
 	}
+}
+
+fn catalog_model(
+	discovery: &llm::discovery::ModelDiscovery,
+	name: &str,
+	catalog: &llm::catalog::CatalogSnapshot,
+) -> String {
+	catalog
+		.model_ids(&discovery.provider)
+		.map(|ids| discovery.catalog_model(name, ids))
+		.unwrap_or_else(|| discovery.model.as_deref().unwrap_or(name).to_string())
 }
 
 fn is_responses_websocket(req: &Request) -> bool {
@@ -1017,9 +1066,11 @@ pub(crate) async fn set_llm_cel_context(req: &mut Request, include_body: bool) -
 			.map(|m| strng::new(&m.0))
 			.or(previous)
 			.unwrap_or_else(|| request_model.clone());
+		let cost_status = req.extensions().get::<ModelCostStatus>().map(|s| s.0);
 		req.extensions_mut().insert(cel::RequestModel {
 			request_model,
 			original_model,
+			cost_status,
 		});
 	}
 	Ok(())
@@ -1551,12 +1602,17 @@ mod tests {
 			vec![],
 		);
 		let route_type = |name: &str, path: &str| {
-			let req = ::http::Request::builder()
+			let mut req = ::http::Request::builder()
 				.uri(path)
 				.body(http::Body::empty())
 				.expect("valid request");
 			router
-				.resolve_concrete_model(name, false, &req)
+				.resolve_concrete_model(
+					name,
+					false,
+					&mut req,
+					&llm::catalog::ModelCatalog::default(),
+				)
 				.expect("authorized")
 				.expect("model exists")
 				.route_type
@@ -1981,8 +2037,9 @@ mod tests {
 			.body(http::Body::empty())
 			.expect("valid request");
 
-		assert!(model_authorized(&model, &allowed));
-		assert!(!model_authorized(&model, &denied));
+		let catalog = llm::catalog::ModelCatalog::default().snapshot();
+		assert!(model_authorized(&model, "gpt-5-mini", &allowed, &catalog));
+		assert!(!model_authorized(&model, "gpt-5-mini", &denied, &catalog));
 	}
 
 	#[test]

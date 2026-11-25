@@ -435,6 +435,20 @@ impl CatalogSnapshot {
 		self.catalog.as_ref()?.resolve(provider, model)
 	}
 
+	/// Whether one model can be priced, before any usage is known.
+	pub(crate) fn cost_status(&self, provider: &str, model: &str) -> CostLookupStatus {
+		let Some(catalog) = self.catalog.as_ref() else {
+			return CostLookupStatus::NoCatalog;
+		};
+		match catalog.resolve_entry(provider, model) {
+			None => CostLookupStatus::Missing,
+			Some((_, entry)) if entry.effective_rates(0, &PricingTier::Standard).is_empty() => {
+				CostLookupStatus::Unpriced
+			},
+			Some(_) => CostLookupStatus::Exact,
+		}
+	}
+
 	/// Borrow model IDs for one provider from this immutable snapshot.
 	/// Returns `None` when the catalog does not know the provider.
 	pub(crate) fn model_ids(&self, provider: &str) -> Option<impl Iterator<Item = &str>> {

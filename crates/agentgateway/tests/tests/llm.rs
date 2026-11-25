@@ -925,6 +925,59 @@ llm:
 }
 
 #[tokio::test]
+async fn llm_local_router_authorizes_models_by_cost_status() {
+	let mock = body_mock(llm_body!("response/completions/basic.json")).await;
+	let config = format!(
+		r#"
+llm:
+  port: 0
+  models:
+  - name: fast
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    params:
+      model: priced
+      baseUrl: http://{0}/v1
+  - name: "*"
+    provider: openAI
+    authorization:
+      rules:
+      - 'llm.costStatus != "missing"'
+    params:
+      baseUrl: http://{0}/v1
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	t.pi
+		.model_catalog
+		.replace_sources(vec![agentgateway::ModelCatalogSource::Inline {
+			inline: r#"{"providers":{"openai":{"models":{"priced":{"rates":{"input":"1","output":"2"}},"free":{}}}}}"#
+				.to_string(),
+		}])
+		.await
+		.expect("inline catalog loads");
+	let io = t.serve_http(strng::literal!("bind/0"));
+
+	let models = list_models(io.clone(), &[]).await;
+	for model in ["fast", "free", "priced"] {
+		assert!(models.iter().any(|m| m == model), "{model} listed");
+	}
+	for (model, status) in [
+		("priced", StatusCode::OK),
+		("free", StatusCode::OK),
+		("fast", StatusCode::OK),
+		("unknown", StatusCode::FORBIDDEN),
+	] {
+		let res = send_completions_with_model(io.clone(), model, &[]).await;
+		assert_eq!(res.status(), status, "{model}");
+	}
+	assert_eq!(mock.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn llm_local_router_handles_models_virtual_model_and_missing_model() {
 	let mock = body_mock(llm_body!("response/completions/basic.json")).await;
 	let config = format!(
